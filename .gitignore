@@ -1,0 +1,6 @@
+.vs/
+.vscode/
+.env
+manager_bot.db
+__pycache__/
+*.pyc
