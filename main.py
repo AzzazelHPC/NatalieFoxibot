@@ -65,14 +65,9 @@ class PenaltyState(StatesGroup):
     reason = State()
 
 
-class TaskDeleteState(StatesGroup):
-    ids = State()
-    day = State()
-
-
-class KegDeleteState(StatesGroup):
-    ids = State()
-    day = State()
+class ReassignTaskState(StatesGroup):
+    task_id = State()
+    assignee = State()
 
 
 # =======================
@@ -197,6 +192,15 @@ async def init_db():
             day TEXT NOT NULL,
             created_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day TEXT NOT NULL,
+            user_id INTEGER,
+            label TEXT,
+            selected_by INTEGER,
+            created_at TEXT
+        );
         """)
 
         # Миграции для старой базы
@@ -222,6 +226,9 @@ async def init_db():
             "penalties_enabled": "1",
             "auto_overdue_penalty": "5",
             "secret_button_enabled": "1",
+            "shift_question_enabled": "1",
+            "shift_question_time": "07:05",
+            "shift_only_reminders": "1",
         }
         for k, v in defaults.items():
             await conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
@@ -292,6 +299,42 @@ def bool_text(value: str) -> str:
     return "вкл" if str(value) == "1" else "выкл"
 
 
+async def get_shift_users(day: Optional[str] = None) -> list[int]:
+    day = day or today_str()
+    async with db() as conn:
+        cur = await conn.execute("SELECT user_id FROM shifts WHERE day=? AND user_id IS NOT NULL", (day,))
+        rows = await cur.fetchall()
+    return [int(row[0]) for row in rows]
+
+
+async def clear_shift(day: Optional[str] = None):
+    day = day or today_str()
+    async with db() as conn:
+        await conn.execute("DELETE FROM shifts WHERE day=?", (day,))
+        await conn.commit()
+
+
+async def set_shift_users(user_ids: list[int], selected_by: Optional[int] = None, label: str = ""):
+    day = today_str()
+    async with db() as conn:
+        await conn.execute("DELETE FROM shifts WHERE day=?", (day,))
+        if user_ids:
+            for uid in user_ids:
+                await conn.execute("INSERT INTO shifts(day,user_id,label,selected_by,created_at) VALUES(?,?,?,?,?)", (day, uid, label, selected_by, now_iso()))
+        else:
+            await conn.execute("INSERT INTO shifts(day,user_id,label,selected_by,created_at) VALUES(?,?,?,?,?)", (day, None, label or "none", selected_by, now_iso()))
+        await conn.commit()
+
+
+async def get_shift_recipients(default_user_id: Optional[int] = None) -> list[int]:
+    if await get_setting("shift_only_reminders") != "1":
+        return [default_user_id] if default_user_id else await get_approved_users()
+    shift_users = await get_shift_users()
+    if shift_users:
+        return shift_users
+    return [default_user_id] if default_user_id else await get_approved_users()
+
+
 # =======================
 # Keyboards
 # =======================
@@ -305,9 +348,9 @@ def main_menu(is_admin_user=False):
     kb.button(text="📊 Моя статистика")
     kb.button(text="🤖 ИИ управляющий")
     kb.button(text="🦊 Секретная кнопка")
-    kb.button(text="🎰 Игра")
     if is_admin_user:
         kb.button(text="👥 Пользователи")
+        kb.button(text="🧑‍🍺 Смена")
         kb.button(text="⚖️ Штрафы")
         kb.button(text="⚙️ Настройки")
     kb.adjust(2)
@@ -335,9 +378,6 @@ def tasks_menu():
     kb.button(text="📋 Активные", callback_data="task:list_active")
     kb.button(text="✅ Выполненные", callback_data="task:list_done")
     kb.button(text="👤 Мои задачи", callback_data="task:my")
-    kb.button(text="🗓 Задачи по дням", callback_data="task:days")
-    kb.button(text="🗑 Удалить задачи по ID", callback_data="task:delete_ids")
-    kb.button(text="🧨 Удалить задачи за день", callback_data="task:delete_day")
     kb.button(text="↩️ Назад", callback_data="back:main")
     kb.adjust(1)
     return kb.as_markup()
@@ -348,9 +388,6 @@ def kegs_menu():
     kb.button(text="🍺 Открыть кегу", callback_data="keg:open")
     kb.button(text="📋 Открытые кеги", callback_data="keg:list_open")
     kb.button(text="⚠️ Скоро просрочка", callback_data="keg:priority")
-    kb.button(text="🗓 Кеги по дням", callback_data="keg:days")
-    kb.button(text="🗑 Удалить кеги по ID", callback_data="keg:delete_ids")
-    kb.button(text="🧨 Удалить кеги за день", callback_data="keg:delete_day")
     kb.button(text="↩️ Назад", callback_data="back:main")
     kb.adjust(1)
     return kb.as_markup()
@@ -360,6 +397,8 @@ def task_buttons(task_id: int):
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Сделано", callback_data=f"taskstatus:{task_id}:done")
     kb.button(text="⏳ В процессе", callback_data=f"taskstatus:{task_id}:process")
+    kb.button(text="📅 Напомнить завтра", callback_data=f"taskremind:{task_id}:tomorrow")
+    kb.button(text="🔄 Передать задачу", callback_data=f"taskreassign:{task_id}")
     kb.button(text="❌ Не могу", callback_data=f"taskstatus:{task_id}:cant")
     kb.adjust(1)
     return kb.as_markup()
@@ -388,6 +427,9 @@ def settings_menu():
         ("Штрафы: вкл/выкл", "penalties_enabled"),
         ("Автоштраф за просрочку", "auto_overdue_penalty"),
         ("Секретная кнопка: вкл/выкл", "secret_button_enabled"),
+        ("Вопрос о смене: вкл/выкл", "shift_question_enabled"),
+        ("Время вопроса о смене", "shift_question_time"),
+        ("Напоминания только смене: вкл/выкл", "shift_only_reminders"),
     ]
     for title, key in items:
         kb.button(text=title, callback_data=f"set:{key}")
@@ -437,6 +479,26 @@ def user_manage_buttons(user_id: int):
     kb.button(text="✅ Одобрить", callback_data=f"user:approve:{user_id}")
     kb.button(text="🚫 Удалить/забанить", callback_data=f"user:ban:{user_id}")
     kb.button(text="↩️ Назад", callback_data="users:approved")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def shift_menu():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="👤 Кто сегодня на смене?", callback_data="shift:ask_now")
+    kb.button(text="📋 Текущая смена", callback_data="shift:current")
+    kb.button(text="🧹 Очистить смену", callback_data="shift:clear")
+    kb.button(text="↩️ Назад", callback_data="back:main")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def shift_select_keyboard(users):
+    kb = InlineKeyboardBuilder()
+    for uid, name in users:
+        kb.button(text=name or str(uid), callback_data=f"shift:set:{uid}")
+    kb.button(text="👥 Все/оба", callback_data="shift:set:all")
+    kb.button(text="❌ Никто", callback_data="shift:set:none")
     kb.adjust(1)
     return kb.as_markup()
 
@@ -731,6 +793,13 @@ async def show_users(message: Message):
     await message.answer("👥 Управление пользователями:", reply_markup=users_menu())
 
 
+@dp.message(F.text == "🧑‍🍺 Смена")
+async def show_shift_section(message: Message):
+    if not await is_admin(message.from_user.id):
+        return await message.answer("Только админ.")
+    await message.answer("🧑‍🍺 Управление сменой:", reply_markup=shift_menu())
+
+
 @dp.message(F.text == "⚖️ Штрафы")
 async def show_penalties(message: Message):
     if not await is_admin(message.from_user.id):
@@ -865,6 +934,65 @@ async def list_my(cb: CallbackQuery):
     await cb.answer()
 
 
+@dp.callback_query(F.data.startswith("taskremind:"))
+async def task_remind_later(cb: CallbackQuery):
+    task_id = int(cb.data.split(":")[1])
+    new_due = now_dt() + timedelta(hours=24)
+    async with db() as conn:
+        await conn.execute("UPDATE tasks SET due_at=?, last_remind_at=NULL, updated_at=? WHERE id=?", (new_due.isoformat(), now_iso(), task_id))
+        await conn.execute("INSERT INTO task_history(task_id,user_id,action,comment,created_at) VALUES(?,?,?,?,?)", (task_id, cb.from_user.id, "remind_tomorrow", "Напомнить завтра", now_iso()))
+        await conn.commit()
+    await log_action(cb.from_user.id, "task_remind_tomorrow", f"#{task_id}")
+    await cb.message.answer(f"📅 Ок, напомню по задаче #{task_id} завтра примерно в это же время.")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("taskreassign:"))
+async def task_reassign_start(cb: CallbackQuery, state: FSMContext):
+    task_id = int(cb.data.split(":")[1])
+    if not await is_admin(cb.from_user.id):
+        async with db() as conn:
+            cur = await conn.execute("SELECT assignee_id FROM tasks WHERE id=?", (task_id,))
+            row = await cur.fetchone()
+        if not row or int(row[0]) != cb.from_user.id:
+            return await cb.answer("Передавать можно только свои задачи или админу.", show_alert=True)
+    async with db() as conn:
+        cur = await conn.execute("SELECT user_id, full_name FROM users WHERE approved=1 AND banned=0 ORDER BY role='admin' DESC, full_name")
+        users = await cur.fetchall()
+    kb = InlineKeyboardBuilder()
+    for uid, name in users:
+        kb.button(text=name or str(uid), callback_data=f"taskassignnew:{task_id}:{uid}")
+    kb.button(text="↩️ Назад", callback_data="task:my")
+    kb.adjust(1)
+    await cb.message.answer(f"🔄 Кому передать задачу #{task_id}?", reply_markup=kb.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("taskassignnew:"))
+async def task_reassign_finish(cb: CallbackQuery):
+    _, task_id, new_uid = cb.data.split(":")
+    task_id = int(task_id)
+    new_uid = int(new_uid)
+    async with db() as conn:
+        cur = await conn.execute("SELECT title,assignee_id FROM tasks WHERE id=?", (task_id,))
+        row = await cur.fetchone()
+        if not row:
+            return await cb.answer("Задача не найдена", show_alert=True)
+        title, old_uid = row
+        if not await is_admin(cb.from_user.id) and int(old_uid) != cb.from_user.id:
+            return await cb.answer("Передавать можно только свои задачи или админу.", show_alert=True)
+        await conn.execute("UPDATE tasks SET assignee_id=?, updated_at=?, last_remind_at=NULL WHERE id=?", (new_uid, now_iso(), task_id))
+        await conn.execute("INSERT INTO task_history(task_id,user_id,action,comment,created_at) VALUES(?,?,?,?,?)", (task_id, cb.from_user.id, "reassigned", f"{old_uid} -> {new_uid}", now_iso()))
+        await conn.commit()
+    await log_action(cb.from_user.id, "task_reassigned", f"#{task_id}: {old_uid} -> {new_uid}")
+    try:
+        await bot.send_message(new_uid, f"🔄 Тебе передали задачу #{task_id}:\n{title}", reply_markup=task_buttons(task_id))
+    except Exception:
+        pass
+    await cb.message.answer(f"✅ Задача #{task_id} передана пользователю {new_uid}.")
+    await cb.answer()
+
+
 @dp.callback_query(F.data.startswith("taskstatus:"))
 async def change_task_status(cb: CallbackQuery):
     _, task_id, status = cb.data.split(":")
@@ -896,182 +1024,6 @@ async def change_task_status(cb: CallbackQuery):
                 await bot.send_message(admin, f"📌 Задача #{task_id}: статус {status} от {cb.from_user.full_name}")
             except Exception:
                 pass
-    await cb.answer()
-
-
-
-# =======================
-# Task history / delete tools
-# =======================
-
-def parse_id_list(text: str):
-    ids = []
-    for part in text.replace(";", ",").replace(" ", ",").split(","):
-        part = part.strip()
-        if part.isdigit():
-            ids.append(int(part))
-    return sorted(set(ids))
-
-
-async def render_task_days(limit: int = 14):
-    async with db() as conn:
-        cur = await conn.execute("""
-        SELECT substr(created_at,1,10) AS day,
-               COUNT(*) AS total,
-               SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done_count,
-               SUM(CASE WHEN status!='done' THEN 1 ELSE 0 END) AS active_count
-        FROM tasks
-        GROUP BY substr(created_at,1,10)
-        ORDER BY day DESC
-        LIMIT ?
-        """, (limit,))
-        rows = await cur.fetchall()
-    if not rows:
-        return "📭 Задач по дням пока нет.", None
-    kb = InlineKeyboardBuilder()
-    lines = ["🗓 <b>Задачи по дням</b>\n"]
-    for day, total, done_count, active_count in rows:
-        done_count = done_count or 0
-        active_count = active_count or 0
-        lines.append(f"📅 <b>{day}</b> — всего: {total}, ✅ {done_count}, ⏳ {active_count}")
-        kb.button(text=f"📅 {day} ({total})", callback_data=f"task:day:{day}")
-    kb.button(text="↩️ Назад", callback_data="back:main")
-    kb.adjust(1)
-    return "\n".join(lines), kb.as_markup()
-
-
-async def render_tasks_for_day(day: str):
-    async with db() as conn:
-        cur = await conn.execute("""
-        SELECT t.id,t.title,t.status,t.assignee_id,t.due_at,COALESCE(u.full_name, t.assignee_id),t.created_at
-        FROM tasks t
-        LEFT JOIN users u ON u.user_id=t.assignee_id
-        WHERE substr(t.created_at,1,10)=?
-        ORDER BY t.id DESC
-        """, (day,))
-        rows = await cur.fetchall()
-    if not rows:
-        return f"📭 За {day} задач нет."
-    status_map = {"new": "🆕", "process": "⏳", "done": "✅", "cant": "❌"}
-    lines = [f"📅 <b>Задачи за {day}</b>\n"]
-    for task_id, title, status, assignee_id, due_at, assignee_name, created_at in rows:
-        created = created_at[11:16] if created_at and len(created_at) >= 16 else "--:--"
-        due = "-"
-        if due_at:
-            try:
-                due = datetime.fromisoformat(due_at).strftime("%d.%m %H:%M")
-            except Exception:
-                due = due_at
-        lines.append(
-            f"{status_map.get(status,'•')} <b>#{task_id}</b> {title}\n"
-            f"👤 {assignee_name}\n"
-            f"🕒 Создана: {created}\n"
-            f"⏰ Дедлайн: {due}\n"
-            f"📌 Статус: {status}\n"
-        )
-    return "\n".join(lines)
-
-
-async def delete_tasks_by_ids(ids, deleted_by: int):
-    if not ids:
-        return 0
-    placeholders = ",".join("?" for _ in ids)
-    async with db() as conn:
-        cur = await conn.execute(f"SELECT id,title FROM tasks WHERE id IN ({placeholders})", ids)
-        rows = await cur.fetchall()
-        found_ids = [row[0] for row in rows]
-        if not found_ids:
-            return 0
-        ph = ",".join("?" for _ in found_ids)
-        await conn.execute(f"DELETE FROM task_history WHERE task_id IN ({ph})", found_ids)
-        await conn.execute(f"DELETE FROM karma_events WHERE task_id IN ({ph})", found_ids)
-        await conn.execute(f"DELETE FROM tasks WHERE id IN ({ph})", found_ids)
-        await conn.commit()
-    await log_action(deleted_by, "tasks_deleted", ", ".join([f"#{i}" for i in found_ids]))
-    return len(found_ids)
-
-
-async def delete_tasks_by_day(day: str, deleted_by: int):
-    async with db() as conn:
-        cur = await conn.execute("SELECT id FROM tasks WHERE substr(created_at,1,10)=?", (day,))
-        ids = [row[0] for row in await cur.fetchall()]
-    return await delete_tasks_by_ids(ids, deleted_by)
-
-
-@dp.callback_query(F.data == "task:days")
-async def task_days(cb: CallbackQuery):
-    text, markup = await render_task_days()
-    await cb.message.answer(text, reply_markup=markup, parse_mode="HTML")
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("task:day:"))
-async def task_day_detail(cb: CallbackQuery):
-    day = cb.data.split(":", 2)[2]
-    kb = InlineKeyboardBuilder()
-    if await is_admin(cb.from_user.id):
-        kb.button(text=f"🧨 Удалить все за {day}", callback_data=f"task:delete_day_confirm:{day}")
-    kb.button(text="↩️ Назад", callback_data="task:days")
-    kb.adjust(1)
-    await cb.message.answer(await render_tasks_for_day(day), reply_markup=kb.as_markup(), parse_mode="HTML")
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "task:delete_ids")
-async def task_delete_ids_start(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Удалять задачи может только админ.", show_alert=True)
-    await state.set_state(TaskDeleteState.ids)
-    await cb.message.answer(
-        "🗑 Напиши ID задач, которые удалить.\n\nМожно через запятую:\n<code>12, 15, 18</code>\n\n↩️ Назад — отменить.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    await cb.answer()
-
-
-@dp.message(TaskDeleteState.ids)
-async def task_delete_ids_finish(message: Message, state: FSMContext):
-    ids = parse_id_list(message.text or "")
-    if not ids:
-        return await message.answer("Не вижу ID. Пример: 12, 15, 18")
-    deleted = await delete_tasks_by_ids(ids, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ Удалено задач: {deleted}\nID: {', '.join(map(str, ids))}", reply_markup=main_menu(await is_admin(message.from_user.id)))
-
-
-@dp.callback_query(F.data == "task:delete_day")
-async def task_delete_day_start(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Удалять задачи может только админ.", show_alert=True)
-    await state.set_state(TaskDeleteState.day)
-    await cb.message.answer(
-        "🧨 Напиши дату, за которую удалить все задачи.\n\nФормат: <code>2026-06-11</code>\n\n↩️ Назад — отменить.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    await cb.answer()
-
-
-@dp.message(TaskDeleteState.day)
-async def task_delete_day_finish(message: Message, state: FSMContext):
-    day = (message.text or "").strip()
-    try:
-        datetime.strptime(day, "%Y-%m-%d")
-    except Exception:
-        return await message.answer("Нужна дата в формате 2026-06-11")
-    deleted = await delete_tasks_by_day(day, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ За {day} удалено задач: {deleted}", reply_markup=main_menu(await is_admin(message.from_user.id)))
-
-
-@dp.callback_query(F.data.startswith("task:delete_day_confirm:"))
-async def task_delete_day_confirm(cb: CallbackQuery):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Только админ.", show_alert=True)
-    day = cb.data.rsplit(":", 1)[1]
-    deleted = await delete_tasks_by_day(day, cb.from_user.id)
-    await cb.message.edit_text(f"✅ За {day} удалено задач: {deleted}")
     await cb.answer()
 
 
@@ -1176,164 +1128,6 @@ async def close_keg(cb: CallbackQuery):
     await cb.answer()
 
 
-
-# =======================
-# Keg day list / delete tools
-# =======================
-
-async def render_keg_days(limit: int = 14):
-    async with db() as conn:
-        cur = await conn.execute("""
-        SELECT substr(opened_at,1,10) AS day,
-               COUNT(*) AS total,
-               SUM(CASE WHEN status='open' THEN 1 ELSE 0 END) AS opened,
-               SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END) AS closed
-        FROM kegs
-        GROUP BY substr(opened_at,1,10)
-        ORDER BY day DESC
-        LIMIT ?
-        """, (limit,))
-        rows = await cur.fetchall()
-    if not rows:
-        return "📭 Кег по дням пока нет.", None
-    kb = InlineKeyboardBuilder()
-    lines = ["🗓 <b>Кеги по дням</b>\n"]
-    for day, total, opened, closed in rows:
-        opened = opened or 0
-        closed = closed or 0
-        lines.append(f"📅 <b>{day}</b> — всего: {total}, 🍺 открыто: {opened}, ✅ закрыто: {closed}")
-        kb.button(text=f"📅 {day} ({total})", callback_data=f"keg:day:{day}")
-    kb.button(text="↩️ Назад", callback_data="back:main")
-    kb.adjust(1)
-    return "\n".join(lines), kb.as_markup()
-
-
-async def render_kegs_for_day(day: str):
-    async with db() as conn:
-        cur = await conn.execute("""
-        SELECT id,beer_name,opened_at,expires_at,status,closed_at
-        FROM kegs
-        WHERE substr(opened_at,1,10)=?
-        ORDER BY id DESC
-        """, (day,))
-        rows = await cur.fetchall()
-    if not rows:
-        return f"📭 За {day} кег нет."
-    lines = [f"📅 <b>Кеги за {day}</b>\n"]
-    for keg_id, beer, opened_at, expires_at, status, closed_at in rows:
-        st = "🍺 открыта" if status == "open" else "✅ закрыта"
-        opened = opened_at[11:16] if opened_at and len(opened_at) >= 16 else "--:--"
-        exp = "-"
-        if expires_at:
-            try:
-                exp = datetime.fromisoformat(expires_at).strftime("%d.%m %H:%M")
-            except Exception:
-                exp = expires_at
-        lines.append(f"🍺 <b>#{keg_id}</b> {beer}\n🕒 Открыта: {opened}\n⏰ Годна до: {exp}\n📌 Статус: {st}\n")
-    return "\n".join(lines)
-
-
-async def delete_kegs_by_ids(ids, deleted_by: int):
-    if not ids:
-        return 0
-    placeholders = ",".join("?" for _ in ids)
-    async with db() as conn:
-        cur = await conn.execute(f"SELECT id,beer_name FROM kegs WHERE id IN ({placeholders})", ids)
-        rows = await cur.fetchall()
-        found_ids = [row[0] for row in rows]
-        if not found_ids:
-            return 0
-        ph = ",".join("?" for _ in found_ids)
-        await conn.execute(f"DELETE FROM kegs WHERE id IN ({ph})", found_ids)
-        await conn.commit()
-    await log_action(deleted_by, "kegs_deleted", ", ".join([f"#{i}" for i in found_ids]))
-    return len(found_ids)
-
-
-async def delete_kegs_by_day(day: str, deleted_by: int):
-    async with db() as conn:
-        cur = await conn.execute("SELECT id FROM kegs WHERE substr(opened_at,1,10)=?", (day,))
-        ids = [row[0] for row in await cur.fetchall()]
-    return await delete_kegs_by_ids(ids, deleted_by)
-
-
-@dp.callback_query(F.data == "keg:days")
-async def keg_days_list(cb: CallbackQuery):
-    text, markup = await render_keg_days()
-    await cb.message.answer(text, reply_markup=markup, parse_mode="HTML")
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("keg:day:"))
-async def keg_day_detail(cb: CallbackQuery):
-    day = cb.data.split(":", 2)[2]
-    kb = InlineKeyboardBuilder()
-    if await is_admin(cb.from_user.id):
-        kb.button(text=f"🧨 Удалить все за {day}", callback_data=f"keg:delete_day_confirm:{day}")
-    kb.button(text="↩️ Назад", callback_data="keg:days")
-    kb.adjust(1)
-    await cb.message.answer(await render_kegs_for_day(day), reply_markup=kb.as_markup(), parse_mode="HTML")
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "keg:delete_ids")
-async def keg_delete_ids_start(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Удалять кеги может только админ.", show_alert=True)
-    await state.set_state(KegDeleteState.ids)
-    await cb.message.answer(
-        "🗑 Напиши ID кег, которые удалить.\n\nМожно через запятую:\n<code>3, 4, 7</code>\n\n↩️ Назад — отменить.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    await cb.answer()
-
-
-@dp.message(KegDeleteState.ids)
-async def keg_delete_ids_finish(message: Message, state: FSMContext):
-    ids = parse_id_list(message.text or "")
-    if not ids:
-        return await message.answer("Не вижу ID. Пример: 3, 4, 7")
-    deleted = await delete_kegs_by_ids(ids, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ Удалено кег: {deleted}\nID: {', '.join(map(str, ids))}", reply_markup=main_menu(await is_admin(message.from_user.id)))
-
-
-@dp.callback_query(F.data == "keg:delete_day")
-async def keg_delete_day_start(cb: CallbackQuery, state: FSMContext):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Удалять кеги может только админ.", show_alert=True)
-    await state.set_state(KegDeleteState.day)
-    await cb.message.answer(
-        "🧨 Напиши дату, за которую удалить все кеги.\n\nФормат: <code>2026-06-11</code>\n\n↩️ Назад — отменить.",
-        reply_markup=cancel_keyboard(),
-        parse_mode="HTML"
-    )
-    await cb.answer()
-
-
-@dp.message(KegDeleteState.day)
-async def keg_delete_day_finish(message: Message, state: FSMContext):
-    day = (message.text or "").strip()
-    try:
-        datetime.strptime(day, "%Y-%m-%d")
-    except Exception:
-        return await message.answer("Нужна дата в формате 2026-06-11")
-    deleted = await delete_kegs_by_day(day, message.from_user.id)
-    await state.clear()
-    await message.answer(f"✅ За {day} удалено кег: {deleted}", reply_markup=main_menu(await is_admin(message.from_user.id)))
-
-
-@dp.callback_query(F.data.startswith("keg:delete_day_confirm:"))
-async def keg_delete_day_confirm(cb: CallbackQuery):
-    if not await is_admin(cb.from_user.id):
-        return await cb.answer("Только админ.", show_alert=True)
-    day = cb.data.rsplit(":", 1)[1]
-    deleted = await delete_kegs_by_day(day, cb.from_user.id)
-    await cb.message.edit_text(f"✅ За {day} удалено кег: {deleted}")
-    await cb.answer()
-
-
 # =======================
 # AI
 # =======================
@@ -1392,6 +1186,13 @@ async def get_shop_context() -> str:
     text.append("\nКарма:")
     for name, score in karma:
         text.append(f"- {name}: {score}")
+
+    shift_users = await get_shift_users()
+    text.append("\nСегодняшняя смена:")
+    if shift_users:
+        text.append("- " + ", ".join(map(str, shift_users)))
+    else:
+        text.append("- смена не выбрана")
 
     text.append("\nПоследние действия:")
     if logs:
@@ -1637,58 +1438,6 @@ async def ai_action_confirm(cb: CallbackQuery):
     await cb.answer()
 
 
-
-# =======================
-# Mini game
-# =======================
-
-GAME_REELS = ["🍺", "🍟", "🦊", "👑", "⭐", "💀", "🔥"]
-
-
-def game_keyboard():
-    kb = InlineKeyboardBuilder()
-    kb.button(text="🎰 Крутить ещё", callback_data="game:spin")
-    kb.button(text="↩️ Назад", callback_data="back:main")
-    kb.adjust(1)
-    return kb.as_markup()
-
-
-async def spin_game(user_id: int):
-    reels = [random.choice(GAME_REELS) for _ in range(3)]
-    unique = len(set(reels))
-    points = 0
-    if unique == 1:
-        points = 25
-        comment = "💎 ДЖЕКПОТ! Три одинаковых символа. Пивные боги аплодируют."
-    elif unique == 2:
-        points = 7
-        comment = "😎 Два совпадения. Нормально так фартануло."
-    elif "💀" in reels:
-        points = -3
-        comment = "💀 Череп выпал. Небольшой штраф от пивной вселенной."
-    else:
-        comment = "🎲 Мимо, но настроение засчитано."
-
-    if points:
-        await add_karma(user_id, points, f"Мини-игра: {' '.join(reels)}", user_id)
-    await log_action(user_id, "game_spin", f"{' '.join(reels)}; karma={points}")
-
-    sign = "+" if points > 0 else ""
-    karma_text = f"\n⚖️ Карма: {sign}{points}" if points else "\n⚖️ Карма: без изменений"
-    return f"🎰 <b>Пивной автомат</b>\n\n{'  '.join(reels)}\n\n{comment}{karma_text}"
-
-
-@dp.message(F.text == "🎰 Игра")
-async def game_message(message: Message):
-    await message.answer(await spin_game(message.from_user.id), reply_markup=game_keyboard(), parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "game:spin")
-async def game_spin_cb(cb: CallbackQuery):
-    await cb.message.answer(await spin_game(cb.from_user.id), reply_markup=game_keyboard(), parse_mode="HTML")
-    await cb.answer()
-
-
 # =======================
 # Reports / History
 # =======================
@@ -1712,38 +1461,14 @@ async def reports(message: Message):
 async def history(message: Message):
     async with db() as conn:
         cur = await conn.execute("""
-        SELECT l.user_id,COALESCE(u.full_name,l.user_id),l.action,l.details,l.created_at
-        FROM action_log l
-        LEFT JOIN users u ON u.user_id=l.user_id
-        ORDER BY l.id DESC LIMIT 40
+        SELECT user_id,action,details,created_at FROM action_log
+        ORDER BY id DESC LIMIT 30
         """)
         rows = await cur.fetchall()
     if not rows:
         return await message.answer("История пустая.")
-
-    emoji = {
-        "task_created": "📋",
-        "task_status": "📌",
-        "tasks_deleted": "🗑",
-        "keg_opened": "🍺",
-        "keg_closed": "✅",
-        "kegs_deleted": "🗑",
-        "setting_changed": "⚙️",
-        "karma": "⚖️",
-        "game_spin": "🎰",
-    }
-    lines = ["🕘 <b>Красивая история действий</b>\n"]
-    last_day = None
-    for uid, name, action, details, created in rows:
-        day = created[:10] if created else "----"
-        time = created[11:16] if created and len(created) >= 16 else "--:--"
-        if day != last_day:
-            lines.append(f"\n📅 <b>{day}</b>")
-            last_day = day
-        icon = emoji.get(action, "•")
-        lines.append(f"{icon} <b>{time}</b> — {name}\n   <code>{action}</code>: {details or '-'}")
-
-    await message.answer("\n".join(lines)[:4000], parse_mode="HTML")
+    text = "🕘 Последние действия:\n" + "\n".join([f"{created[:16]} | {uid} | {act} | {det}" for uid, act, det, created in rows])
+    await message.answer(text[:4000])
 
 
 # =======================
@@ -1830,6 +1555,99 @@ async def ban_user(cb: CallbackQuery):
     except Exception:
         pass
     await cb.message.answer(f"🚫 Пользователь {user_id} удалён/забанен.")
+    await cb.answer()
+
+
+# =======================
+# Shift management
+# =======================
+
+async def ask_shift_to_admins():
+    if await get_setting("shift_question_enabled") != "1":
+        return
+    async with db() as conn:
+        cur = await conn.execute("""
+        SELECT user_id, full_name FROM users
+        WHERE approved=1 AND banned=0
+        ORDER BY role='admin' DESC, full_name
+        """)
+        users = await cur.fetchall()
+    if not users:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(
+                admin_id,
+                "👋 Доброе утро! Кто сегодня на смене?\n\nПосле выбора напоминания будут уходить выбранному человеку/людям.",
+                reply_markup=shift_select_keyboard(users)
+            )
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data == "shift:ask_now")
+async def shift_ask_now(cb: CallbackQuery):
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("Только админ", show_alert=True)
+    await ask_shift_to_admins()
+    await cb.message.answer("✅ Вопрос о смене отправлен админам.", reply_markup=shift_menu())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "shift:current")
+async def shift_current(cb: CallbackQuery):
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("Только админ", show_alert=True)
+    shift_users = await get_shift_users()
+    if not shift_users:
+        await cb.message.answer("Сегодня смена ещё не выбрана.", reply_markup=shift_menu())
+        return await cb.answer()
+    async with db() as conn:
+        q = ",".join("?" for _ in shift_users)
+        cur = await conn.execute(f"SELECT user_id, full_name FROM users WHERE user_id IN ({q})", shift_users)
+        rows = await cur.fetchall()
+    text = "🧑‍🍺 Сегодня на смене:\n\n" + "\n".join([f"• {name or uid} ({uid})" for uid, name in rows])
+    await cb.message.answer(text, reply_markup=shift_menu())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "shift:clear")
+async def shift_clear_cb(cb: CallbackQuery):
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("Только админ", show_alert=True)
+    await clear_shift()
+    await log_action(cb.from_user.id, "shift_cleared", today_str())
+    await cb.message.answer("🧹 Смена на сегодня очищена.", reply_markup=shift_menu())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("shift:set:"))
+async def shift_set(cb: CallbackQuery):
+    if not await is_admin(cb.from_user.id):
+        return await cb.answer("Только админ", show_alert=True)
+    value = cb.data.split(":", 2)[2]
+    if value == "none":
+        await set_shift_users([], cb.from_user.id, "none")
+        await log_action(cb.from_user.id, "shift_set", "none")
+        await cb.message.answer("❌ Записал: сегодня никто не на смене.", reply_markup=shift_menu())
+        return await cb.answer()
+    if value == "all":
+        async with db() as conn:
+            cur = await conn.execute("SELECT user_id FROM users WHERE approved=1 AND banned=0")
+            rows = await cur.fetchall()
+        ids = [row[0] for row in rows]
+        await set_shift_users(ids, cb.from_user.id, "all")
+        await log_action(cb.from_user.id, "shift_set", "all")
+        await cb.message.answer("👥 Записал: сегодня на смене все/оба.", reply_markup=shift_menu())
+        return await cb.answer()
+    user_id = int(value)
+    await set_shift_users([user_id], cb.from_user.id, str(user_id))
+    await log_action(cb.from_user.id, "shift_set", str(user_id))
+    try:
+        await bot.send_message(user_id, "🧑‍🍺 Сегодня ты отмечен(а) как смена. Напоминания будут приходить тебе.")
+    except Exception:
+        pass
+    await cb.message.answer(f"✅ Смена на сегодня назначена: {user_id}", reply_markup=shift_menu())
     await cb.answer()
 
 
@@ -2720,7 +2538,7 @@ async def set_value(message: Message, state: FSMContext):
     value = message.text.strip()
 
     # Мини-валидация
-    if key.endswith("_time") or key in {"daily_task_check_time", "evening_keg_question_time", "morning_priority_time", "mood_question_time", "morning_compliments_time"}:
+    if key.endswith("_time") or key in {"daily_task_check_time", "evening_keg_question_time", "morning_priority_time", "mood_question_time", "morning_compliments_time", "shift_question_time"}:
         try:
             parse_time(value)
         except Exception:
@@ -2765,10 +2583,12 @@ async def remind_unfinished_tasks():
 
         for task_id, title, assignee_id, penalty_applied in rows:
             await conn.execute("UPDATE tasks SET last_remind_at=? WHERE id=?", (now_iso(), task_id))
-            try:
-                await bot.send_message(assignee_id, f"🔔 Напоминание по задаче #{task_id}:\n{title}\nУже сделали?", reply_markup=task_buttons(task_id))
-            except Exception:
-                pass
+            recipients = await get_shift_recipients(assignee_id)
+            for recipient_id in recipients:
+                try:
+                    await bot.send_message(recipient_id, f"🔔 Напоминание по задаче #{task_id}:\n{title}\nУже сделали?", reply_markup=task_buttons(task_id))
+                except Exception:
+                    pass
 
             if int(await get_setting("penalties_enabled")) == 1 and not penalty_applied:
                 points = int(await get_setting("auto_overdue_penalty"))
@@ -2791,29 +2611,35 @@ async def evening_keg_question():
     kb.button(text="Да, открывали", callback_data="keg:open")
     kb.button(text="Нет", callback_data="noop")
     kb.adjust(1)
-
-    # Вопрос по кегам шлём админам, чтобы не спамить всех
-    for admin in ADMIN_IDS:
+    recipients = await get_shift_recipients(None)
+    if not recipients:
+        recipients = ADMIN_IDS
+    for user_id in recipients:
         try:
-            await bot.send_message(admin, "🍺 Сегодня открывали новую кегу?", reply_markup=kb.as_markup())
+            await bot.send_message(user_id, "🍺 Сегодня открывали новую кегу?", reply_markup=kb.as_markup())
         except Exception:
             pass
 
 
 async def morning_priority():
     text = await render_kegs(True)
-    for admin in ADMIN_IDS:
+    recipients = await get_shift_recipients(None)
+    if not recipients:
+        recipients = ADMIN_IDS
+    for user_id in recipients:
         try:
-            await bot.send_message(admin, "🌅 Приоритет на сегодня по пиву:\n\n" + text)
+            await bot.send_message(user_id, "🌅 Приоритет на сегодня по пиву:\n\n" + text)
         except Exception:
             pass
 
 
 async def daily_task_check():
     active = await render_tasks("t.status != 'done'")
-    for admin in ADMIN_IDS:
+    recipients = set(ADMIN_IDS)
+    recipients.update(await get_shift_users())
+    for user_id in recipients:
         try:
-            await bot.send_message(admin, "📋 Вечерняя проверка задач:\n\n" + active)
+            await bot.send_message(user_id, "📋 Вечерняя проверка задач:\n\n" + active)
         except Exception:
             pass
 
@@ -2833,7 +2659,7 @@ async def morning_compliments():
 async def mood_question():
     if await get_setting("mood_enabled") != "1":
         return
-    users = await get_approved_users()
+    users = await get_shift_recipients(None)
     for user_id in users:
         try:
             await bot.send_message(user_id, "🌙 Как прошёл день?", reply_markup=mood_keyboard())
@@ -2861,6 +2687,7 @@ async def setup_scheduled_jobs(restart=False):
         ("morning_priority_time", morning_priority, "morning_priority"),
         ("daily_task_check_time", daily_task_check, "daily_task_check"),
         ("morning_compliments_time", morning_compliments, "morning_compliments"),
+        ("shift_question_time", ask_shift_to_admins, "shift_question"),
         ("mood_question_time", mood_question, "mood_question"),
     ]
 
